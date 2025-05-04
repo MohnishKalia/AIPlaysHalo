@@ -1,0 +1,7 @@
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.7.0
+numpy>=1.24.0
+mss>=9.0.1  # for efficient screen capture
+vgamepad>=0.0.8  # for virtual gamepad control
+pillow>=9.5.0  # required by torchvision
