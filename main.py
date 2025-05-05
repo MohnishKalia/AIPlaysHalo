@@ -3,14 +3,19 @@ import subprocess
 import time
 import os
 import mss
-import mss.models
 import numpy as np
 import vgamepad as vg
 from typing import Optional, Tuple, List, Any, Dict
-from concurrent.futures import ThreadPoolExecutor
 import numpy.typing as npt
+import win32gui # type: ignore
+import win32con # type: ignore
+import win32api # type: ignore
+import random
+from pathlib import Path
 
 # import torch # Import torch when model loading is implemented
+
+assert os.name == 'nt', "This script is designed for Windows only."
 
 # --- Configuration ---
 HALO_CE_DIR = r"C:\Program Files (x86)\Microsoft Games\Halo Custom Edition" # Adjust if necessary
@@ -19,8 +24,15 @@ MULTICLIENT_EXE = os.path.join(HALO_CE_DIR, "multiclient.exe") # Assumes multicl
 HALOCE_EXE = os.path.join(HALO_CE_DIR, "haloce.exe")
 INIT_TXT_PATH = os.path.join(HALO_CE_DIR, r"mods\init.txt") # Assumes init.txt is in mods/HALO_CE_DIR
 
+NUM_CLIENTS = 4 # Number of clients to launch (for now, just one)
+assert NUM_CLIENTS <= 8, "NUM_CLIENTS must be 1-8 for tiling to work properly."
+
+# WIN_WIDTH = 480
+# WIN_HEIGHT = 360
 WIN_WIDTH = 640
 WIN_HEIGHT = 480
+# WIN_WIDTH = 320
+# WIN_HEIGHT = 240
 TARGET_FPS = 30 # Target FPS for the game window
 CAPTURE_FPS = 15 # Target FPS for capture/inference loop
 
@@ -83,6 +95,17 @@ def setup_capture(width: int, height: int) -> Tuple[mss.mss, Dict[str, int]]:
     print(f"Screen capture set up for region: {monitor}")
     return sct, monitor
 
+def setup_client_captures(hwnds: list) -> list:
+    """Sets up capture regions for all client windows based on their HWNDs."""
+    import mss
+    sct = mss.mss()
+    monitors = []
+    for hwnd in hwnds:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+        monitors.append(monitor)
+    return sct, monitors
+
 # TODO: get better mss type
 def capture_frame(sct: mss.mss, monitor: Dict[str, int]) -> npt.NDArray:
     """Captures a frame from the specified monitor region."""
@@ -113,15 +136,16 @@ def run_inference(model: Any, frame_rgb: npt.NDArray) -> List[Any]:
     return detections
 
 # --- Control Policy & Input (Placeholders) ---
-def setup_gamepad() -> Optional[vg.VX360Gamepad]:
-    """Initializes the virtual gamepad."""
-    print("Initializing virtual gamepad...")
+def setup_gamepad(init_left_stick: tuple = None) -> Optional[vg.VX360Gamepad]:
+    """Initializes and returns a virtual gamepad. Optionally sets initial left stick position."""
     try:
         pad = vg.VX360Gamepad()
-        print("Virtual gamepad initialized.")
+        if init_left_stick is not None:
+            x, y = init_left_stick
+            pad.left_joystick_float(x_value_float=x, y_value_float=y)
+            pad.update()
         return pad
     except Exception as e:
-        # Might fail if ViGEmBus driver is not installed
         print(f"Error initializing gamepad: {e}")
         print("Ensure ViGEmBus driver is installed: https://github.com/ViGEm/ViGEmBus/releases")
         return None
@@ -158,15 +182,62 @@ def apply_policy_and_control(detections: List[Any], pad: vg.VX360Gamepad) -> Non
     except Exception as e:
         print(f"Error updating gamepad: {e}")
 
+# --- Window Management ---
+def find_halo_windows(max_clients: int = 8) -> list:
+    """Finds window handles for Halo CE clients (haloce.exe)."""
+    def enum_handler(hwnd, hwnds):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            class_name = win32gui.GetClassName(hwnd)
+            if "Halo" == title or class_name == "Halo":
+                hwnds.append(hwnd)
+    hwnds = []
+    win32gui.EnumWindows(enum_handler, hwnds)
+    # Filter for unique handles, limit to max_clients
+    return hwnds[:max_clients]
+
+def tile_windows(hwnds: list, width: int, height: int, screen_width: int = 1920, screen_height: int = 1080):
+    """Tiles the given window handles in a 2-row, 4-column grid centered on the screen, filling by column, and brings them to the front."""
+    n = len(hwnds)
+    cols = 4
+    rows = 2
+    tile_w = min(width, screen_width // cols)
+    tile_h = min(height, screen_height // rows)
+    grid_w = tile_w * cols
+    grid_h = tile_h * rows
+    offset_x = (screen_width - grid_w) // 2
+    offset_y = (screen_height - grid_h) // 2
+    for idx, hwnd in enumerate(hwnds):
+        col = idx // rows
+        row = idx % rows
+        x = offset_x + col * tile_w
+        y = offset_y + row * tile_h
+        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, win32con.WS_VISIBLE | win32con.WS_POPUP)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, x, y, tile_w, tile_h, win32con.SWP_SHOWWINDOW)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, x, y, tile_w, tile_h, win32con.SWP_SHOWWINDOW)
+        win32gui.BringWindowToTop(hwnd)
+
+def send_dedicated_server_to_back():
+    """Finds the HaloConsole window and sends it to the back."""
+    def enum_handler(hwnd, result):
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if "Halo Console" in title:
+                result.append(hwnd)
+    result = []
+    win32gui.EnumWindows(enum_handler, result)
+    for hwnd in result:
+        win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    NUM_CLIENTS = 1 # Number of clients to launch (for now, just one)
     server_proc = None
-    client_procs = []
-    client_pids = []
+    client_procs = [None] * NUM_CLIENTS # Preallocate list for client spawn processes
+    client_pids = [-1] * NUM_CLIENTS # Preallocate list for client PIDs
     pad = None
     sct = None
+    gamepads = [None] * NUM_CLIENTS # Preallocate list for gamepads
 
     try:
         # 1. Create init.txt (Manual step or add code here to create it)
@@ -186,6 +257,9 @@ if __name__ == "__main__":
         print("Waiting for server to initialize...")
         time.sleep(5) # Give server time to start
 
+        # Send HaloConsole window to back
+        send_dedicated_server_to_back()
+
         # 3. Start Halo Client
         def launch_client(i):
             print(f"Starting Halo client {i+1}/{NUM_CLIENTS}...")
@@ -195,35 +269,68 @@ if __name__ == "__main__":
             )
             return client_proc
         
+        tmp_client_procs = []
         for i in range(NUM_CLIENTS):
             client_proc = launch_client(i)
-            client_procs.append(client_proc)
+            tmp_client_procs.append(client_proc)
             if not client_proc:
                 raise RuntimeError("Failed to start Halo client.")
             print(f"Halo client {i+1}/{NUM_CLIENTS} started (PID: {client_proc.pid}).")
+        client_procs = tmp_client_procs # Update client_procs with successfully launched clients
+        assert len(client_procs) == NUM_CLIENTS, "Mismatch in number of client spawns launched and found."
         print("Waiting for clients to launch and connect...")
         time.sleep(15) # Give clients time to launch and connect to server
 
+        tmp_client_pids = []
         for proc in subprocess.check_output("tasklist", shell=True).decode().splitlines():
             if "haloce.exe" in proc:
                 pid = int(proc.split()[1])
-                client_pids.append(pid)
+                tmp_client_pids.append(pid)
                 print(f"Found Halo client process (PID: {pid}).")
-
+        client_pids = tmp_client_pids # Update client_pids with found PIDs
+        assert len(client_pids) == NUM_CLIENTS, "Mismatch in number of clients launched and found."
+        
         # 4. Setup Capture
-        sct, monitor = setup_capture(WIN_WIDTH, WIN_HEIGHT)
-        if not sct:
-             raise RuntimeError("Failed to set up screen capture.")
+        # Tile Halo windows using pywin32
+        try:
+            hwnds = find_halo_windows(NUM_CLIENTS)
+            # Get monitor resolution
+            screen_width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+            screen_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+            tile_windows(hwnds, WIN_WIDTH, WIN_HEIGHT, screen_width, screen_height)
+            print(f"Tiled {len(hwnds)} Halo window(s) on screen.")
+
+            # Setup capture for all client windows
+            sct, client_monitors = setup_client_captures(hwnds)
+            print(f"Setup capture for {len(client_monitors)} client windows.")
+
+            # --- Take one-time screenshot from each capture ---
+            images_dir = Path("images")
+            images_dir.mkdir(exist_ok=True)
+            for idx, monitor in enumerate(client_monitors):
+                frame = capture_frame(sct, monitor)
+                img_path = images_dir / f"client_{idx+1}.png"
+                from PIL import Image
+                Image.fromarray(frame).save(img_path)
+                print(f"Saved screenshot for client {idx+1} to {img_path}")
+        except Exception as e:
+            print(f"Error tiling Halo windows or setting up capture: {e}")
 
         # 5. Load Model (Placeholder)
         model = load_model()
         # if not model:
         #     raise RuntimeError("Failed to load model.") # Enable when implemented
 
-        # 6. Setup Gamepad
-        pad = setup_gamepad()
-        if not pad:
-            raise RuntimeError("Failed to set up virtual gamepad. Is ViGEmBus installed?")
+        # 6. Setup Gamepads
+        for i in range(NUM_CLIENTS):
+            x = random.uniform(-1, 1)
+            y = random.uniform(-1, 1)
+            pad = setup_gamepad(init_left_stick=(x, y))
+            if pad:
+                print(f"Initialized gamepad {i+1} with random left stick: x={x:.2f}, y={y:.2f}")
+            else:
+                print(f"Error initializing gamepad {i+1}")
+            gamepads[i] = pad # Store gamepad in list
 
         # 7. Main Loop
         print("Starting main loop (capture -> inference -> control)... Press Ctrl+C to stop.")
@@ -231,24 +338,21 @@ if __name__ == "__main__":
         while True:
             loop_start_time = time.time()
 
-            # Capture
-            frame = capture_frame(sct, monitor)
+            # Capture for all clients
+            frames = [capture_frame(sct, monitor) for monitor in client_monitors]
 
-            # save screenshot (optional)
-
-            # Inference (Placeholder)
-            detections = run_inference(model, frame)
-
-            # Control (Placeholder)
-            apply_policy_and_control(detections, pad)
+            # Inference and Control per client
+            for idx, (frame, pad) in enumerate(zip(frames, gamepads, strict=True)):
+                detections = run_inference(model, frame)
+                apply_policy_and_control(detections, pad)
 
             # Regulate loop speed
             elapsed_time = time.time() - loop_start_time
             sleep_time = frame_time - elapsed_time
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            # else:
-            #     print(f"Warning: Loop took longer ({elapsed_time:.3f}s) than target frame time ({frame_time:.3f}s)")
+            else:
+                print(f"Warning: Loop took longer ({elapsed_time:.3f}s) than target frame time ({frame_time:.3f}s)")
 
 
     except KeyboardInterrupt:
@@ -259,11 +363,16 @@ if __name__ == "__main__":
         print("Cleaning up...")
         # Terminate processes
         for proc in client_procs:
-            if proc:
-                print(f"Terminating client spawn process (PID: {proc.pid})...")
-                proc.terminate()
-                proc.wait() # Wait for termination
+            if proc is None:
+                print("No client process found.")
+                continue
+            print(f"Terminating client spawn process (PID: {proc.pid})...")
+            proc.terminate()
+            proc.wait() # Wait for termination
         for pid in client_pids:
+            if pid is None:
+                print("No client PID found.")
+                continue
             try:
                 print(f"Terminating client process (PID: {pid})...")
                 os.kill(pid, signal.SIGTERM) # Force kill
@@ -273,7 +382,4 @@ if __name__ == "__main__":
             print(f"Terminating server process (PID: {server_proc.pid})...")
             server_proc.terminate()
             server_proc.wait() # Wait for termination
-        # Release gamepad (optional, vgamepad might handle this on exit)
-        # if pad:
-        #     del pad # Or specific cleanup method if available
         print("Cleanup complete.")
